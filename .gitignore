@@ -1,0 +1,15 @@
+node_modules
+.pnpm-store
+.next
+dist
+coverage
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+.idea
+.vscode
+prisma/dev.db
+postgres-data
+secrets/

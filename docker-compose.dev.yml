@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:17.5-alpine3.21
+    environment:
+      POSTGRES_DB: nexstream
+      POSTGRES_USER: nexstream
+      POSTGRES_PASSWORD: nexstream
+    ports: ["5432:5432"]
+    volumes: ["postgres_dev:/var/lib/postgresql/data"]
+
+  api:
+    image: node:22.16.0-alpine3.21
+    working_dir: /app
+    command: sh -c "corepack enable && pnpm install && pnpm db:generate && pnpm --filter @nexstream/api dev"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://nexstream:nexstream@postgres:5432/nexstream?schema=public
+    ports: ["4000:4000"]
+    volumes:
+      - .:/app
+      - pnpm_store:/pnpm/store
+    depends_on: [postgres]
+
+  web:
+    image: node:22.16.0-alpine3.21
+    working_dir: /app
+    command: sh -c "corepack enable && pnpm install && pnpm --filter @nexstream/web dev"
+    environment:
+      API_INTERNAL_URL: http://api:4000/api
+    ports: ["3000:3000"]
+    volumes:
+      - .:/app
+      - pnpm_store:/pnpm/store
+    depends_on: [api]
+
+volumes:
+  postgres_dev:
+  pnpm_store:

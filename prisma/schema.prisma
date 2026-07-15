@@ -1,0 +1,145 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id          String             @id @default(uuid())
+  providerKey String             @unique
+  displayName String?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+  credentials XtreamCredential[]
+  sessions    Session[]
+  favorites   Favorite[]
+  history     WatchHistory[]
+  preferences UserPreference?
+  auditEvents AuditEvent[]
+}
+
+model XtreamCredential {
+  id               String   @id @default(uuid())
+  userId           String
+  encryptedPayload String
+  keyVersion       Int      @default(1)
+  persistent       Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessions         Session[]
+
+  @@index([userId])
+}
+
+model Session {
+  id             String               @id @default(uuid())
+  userId         String
+  credentialId   String?
+  tokenFamilyId  String               @unique
+  lastSeenAt     DateTime             @default(now())
+  expiresAt      DateTime
+  revokedAt      DateTime?
+  createdAt      DateTime             @default(now())
+  user           User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  credential     XtreamCredential?    @relation(fields: [credentialId], references: [id], onDelete: SetNull)
+  refreshTokens  RefreshToken[]
+  playbackTokens PlaybackToken[]
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+}
+
+model RefreshToken {
+  id         String   @id @default(uuid())
+  sessionId  String
+  jti        String   @unique
+  tokenHash  String   @unique
+  usedAt     DateTime?
+  revokedAt  DateTime?
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  session    Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, revokedAt])
+  @@index([expiresAt])
+}
+
+model Favorite {
+  id        String   @id @default(uuid())
+  userId    String
+  mediaId   String
+  mediaType String
+  title     String
+  imageUrl  String?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, mediaId])
+  @@index([userId, createdAt])
+}
+
+model WatchHistory {
+  id              String   @id @default(uuid())
+  userId          String
+  mediaId         String
+  mediaType       String
+  title           String
+  imageUrl        String?
+  positionSeconds Int      @default(0)
+  durationSeconds Int      @default(0)
+  watchedSeconds  Int      @default(0)
+  completed       Boolean  @default(false)
+  lastWatchedAt   DateTime @default(now())
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, mediaId])
+  @@index([userId, lastWatchedAt])
+}
+
+model PlaybackToken {
+  id          String   @id @default(uuid())
+  sessionId   String
+  tokenHash   String   @unique
+  mediaId     String
+  mediaType   String
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdAt   DateTime @default(now())
+  session     Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, expiresAt])
+}
+
+model UserPreference {
+  id               String   @id @default(uuid())
+  userId           String   @unique
+  theme            String   @default("dark")
+  language         String   @default("pt-BR")
+  defaultQuality   String   @default("auto")
+  playbackSpeed    Float    @default(1)
+  autoplayNext     Boolean  @default(true)
+  subtitlesEnabled Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model AuditEvent {
+  id            String   @id @default(uuid())
+  userId        String?
+  eventType     String
+  correlationId String?
+  ipHash        String?
+  metadata      Json?
+  createdAt     DateTime @default(now())
+  user          User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([eventType, createdAt])
+}
