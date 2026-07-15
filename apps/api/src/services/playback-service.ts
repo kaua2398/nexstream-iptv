@@ -1,4 +1,3 @@
-import axios from 'axios';
 import type { Request, Response } from 'express';
 import type { PrismaClient } from '@prisma/client';
 import { z } from 'zod';
@@ -10,6 +9,7 @@ import { env } from '../config/env.js';
 import { randomToken, sha256 } from '../utils/crypto.js';
 import { AppError } from '../utils/errors.js';
 import { validatePublicHttpUrl } from '../security/ssrf.js';
+import { axiosGetWithValidatedRedirects } from '../security/safe-http.js';
 
 const playbackRequestSchema = z
   .object({ mediaId: z.string().min(20).max(4096) })
@@ -34,12 +34,30 @@ export class PlaybackService {
     private readonly xtream: XtreamClient,
   ) {}
 
-  async issue(userId: string, sessionId: string, input: unknown): Promise<{ url: string; expiresIn: number }> {
+  async issue(
+    userId: string,
+    sessionId: string,
+    input: unknown,
+  ): Promise<{
+    url: string;
+    expiresIn: number;
+    mode: 'hls' | 'file';
+  }> {
     const { mediaId } = playbackRequestSchema.parse(input);
     const media = this.opaqueIds.parse(mediaId, userId);
     if (!['live', 'movie', 'episode'].includes(media.type)) {
       throw new AppError(400, 'NOT_PLAYABLE', 'Conteúdo não reproduzível.');
     }
+    const normalizedExtension = media.extension
+      ?.trim()
+      .toLowerCase();
+
+    const mode: 'hls' | 'file' =
+      media.type === 'live' ||
+      normalizedExtension === 'm3u8'
+        ? 'hls'
+        : 'file';
+
     const rawToken = randomToken(40);
     await this.db.playbackToken.create({
       data: {
@@ -53,6 +71,7 @@ export class PlaybackService {
     return {
       url: `/api/v1/playback/stream/${encodeURIComponent(rawToken)}`,
       expiresIn: env.PLAYBACK_TOKEN_TTL_SECONDS,
+      mode,
     };
   }
 
@@ -156,19 +175,54 @@ export class PlaybackService {
     upstream: URL,
     playbackTokenId: string,
     rawToken: string,
-    auth: { userId: string; sessionId: string },
+    auth: {
+      userId: string;
+      sessionId: string;
+    },
   ): Promise<void> {
-    await validatePublicHttpUrl(upstream);
-    const response = await axios.get<string>(upstream.toString(), {
-      responseType: 'text',
-      timeout: 12_000,
-      maxRedirects: 0,
-      maxContentLength: 2 * 1024 * 1024,
-      headers: { 'User-Agent': 'NexStream/0.1' },
-    });
-    res.setHeader('content-type', 'application/vnd.apple.mpegurl');
-    res.setHeader('cache-control', 'private, no-store');
-    res.send(this.rewriteManifest(response.data, upstream, playbackTokenId, rawToken, auth));
+    const {
+      response,
+      finalUrl,
+    } =
+      await axiosGetWithValidatedRedirects<string>(
+        upstream,
+        {
+          responseType: 'text',
+          timeout: 12_000,
+          maxContentLength:
+            2 * 1024 * 1024,
+          headers: {
+            'User-Agent':
+              'NexStream/0.1',
+            Accept:
+              'application/vnd.apple.mpegurl, application/x-mpegURL, */*',
+          },
+        },
+      );
+
+    res.setHeader(
+      'content-type',
+      'application/vnd.apple.mpegurl',
+    );
+
+    res.setHeader(
+      'cache-control',
+      'private, no-store',
+    );
+
+    /*
+     * Usa a URL final porque segmentos relativos precisam
+     * ser resolvidos em relação ao destino após o redirect.
+     */
+    res.send(
+      this.rewriteManifest(
+        response.data,
+        finalUrl,
+        playbackTokenId,
+        rawToken,
+        auth,
+      ),
+    );
   }
 
   async segment(
@@ -199,29 +253,88 @@ export class PlaybackService {
     await this.proxyBinary(req, res, target.url);
   }
 
-  private async proxyBinary(req: Request, res: Response, upstream: URL): Promise<void> {
-    await validatePublicHttpUrl(upstream);
+  private async proxyBinary(
+    req: Request,
+    res: Response,
+    upstream: URL,
+  ): Promise<void> {
     const range = req.header('range');
-    if (range && !/^bytes=\d*-\d*$/.test(range)) {
-      throw new AppError(416, 'INVALID_RANGE', 'Intervalo de mídia inválido.');
+
+    if (
+      range &&
+      !/^bytes=\d*-\d*$/.test(range)
+    ) {
+      throw new AppError(
+        416,
+        'INVALID_RANGE',
+        'Intervalo de mídia inválido.',
+      );
     }
-    const response = await axios.get<NodeJS.ReadableStream>(upstream.toString(), {
-      responseType: 'stream',
-      timeout: 30_000,
-      maxRedirects: 0,
-      headers: {
-        'User-Agent': 'NexStream/0.1',
-        ...(range ? { Range: range } : {}),
-      },
-      validateStatus: (status) => status === 200 || status === 206,
-    });
+
+    const { response } =
+      await axiosGetWithValidatedRedirects<NodeJS.ReadableStream>(
+        upstream,
+        {
+          responseType: 'stream',
+          timeout: 30_000,
+          headers: {
+            'User-Agent':
+              'NexStream/0.1',
+            Accept: '*/*',
+            ...(range
+              ? { Range: range }
+              : {}),
+          },
+        },
+      );
+
     res.status(response.status);
-    for (const header of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
-      const value = response.headers[header];
-      if (value) res.setHeader(header, value);
+
+    for (
+      const header of [
+        'content-type',
+        'content-length',
+        'content-range',
+        'accept-ranges',
+      ]
+    ) {
+      const value =
+        response.headers[header];
+
+      if (value) {
+        res.setHeader(
+          header,
+          value,
+        );
+      }
     }
-    res.setHeader('cache-control', 'private, no-store');
-    response.data.on('error', () => res.destroy());
+
+    res.setHeader(
+      'cache-control',
+      'private, no-store',
+    );
+
+    response.data.once(
+      'error',
+      () => {
+        res.destroy();
+      },
+    );
+
+    req.once(
+      'close',
+      () => {
+        if (!res.writableEnded) {
+          const stream = response.data as
+            NodeJS.ReadableStream & {
+              destroy?: () => void;
+            };
+
+          stream.destroy?.();
+        }
+      },
+    );
+
     response.data.pipe(res);
   }
 }

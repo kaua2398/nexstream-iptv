@@ -52,7 +52,12 @@ export function libraryRoutes(db: PrismaClient, opaqueIds: OpaqueIdService): Rou
 
   router.delete('/favorites/:mediaId', requireCsrf, async (req, res) => {
     const auth = (req as AuthenticatedRequest).auth;
-    const mediaId = decodeURIComponent(req.params.mediaId ?? '');
+    const rawMediaId = req.params.mediaId;
+    const mediaId = decodeURIComponent(
+      Array.isArray(rawMediaId)
+        ? (rawMediaId[0] ?? '')
+        : (rawMediaId ?? ''),
+    );
     opaqueIds.parse(mediaId, auth.userId);
     await db.favorite.deleteMany({ where: { userId: auth.userId, mediaId } });
     res.status(204).send();

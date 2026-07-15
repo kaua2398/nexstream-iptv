@@ -11,7 +11,7 @@ export function imageRoutes(db: PrismaClient, images: ImageProxyService): Router
   router.get('/:token', async (req, res) => {
     const token = req.params.token;
     if (!token) throw new AppError(404, 'IMAGE_NOT_FOUND', 'Imagem não encontrada.');
-    const auth = (req as AuthenticatedRequest).auth;
+    const auth = (req as unknown as AuthenticatedRequest).auth;
     await images.proxy(token, auth.userId, res);
   });
   return router;

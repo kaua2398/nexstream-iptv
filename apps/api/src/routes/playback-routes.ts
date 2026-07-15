@@ -13,19 +13,19 @@ export function playbackRoutes(db: PrismaClient, playback: PlaybackService): Rou
   router.use(requireAuth(db));
 
   router.post('/token', tokenLimiter, requireCsrf, async (req, res) => {
-    const auth = (req as AuthenticatedRequest).auth;
+    const auth = (req as unknown as AuthenticatedRequest).auth;
     res.json(await playback.issue(auth.userId, auth.sessionId, req.body));
   });
 
   router.get('/stream/:token', async (req, res) => {
-    const auth = (req as AuthenticatedRequest).auth;
+    const auth = (req as unknown as AuthenticatedRequest).auth;
     const token = req.params.token;
     if (!token) throw new AppError(400, 'TOKEN_REQUIRED', 'Token obrigatório.');
     await playback.stream(req, res, auth, token);
   });
 
   router.get('/segment', async (req, res) => {
-    const auth = (req as AuthenticatedRequest).auth;
+    const auth = (req as unknown as AuthenticatedRequest).auth;
     const playbackToken = typeof req.query.playback === 'string' ? req.query.playback : '';
     const resourceToken = typeof req.query.resource === 'string' ? req.query.resource : '';
     if (!playbackToken || !resourceToken) {

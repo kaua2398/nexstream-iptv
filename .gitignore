@@ -13,3 +13,10 @@ coverage
 prisma/dev.db
 postgres-data
 secrets/
+*-error.txt
+catalog-source-map.txt
+*.zip
+.nexstream-backups/
+node_modules/
+.next/
+apps/web/.next/

@@ -3,7 +3,7 @@ import compression from 'compression';
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import helmet from 'helmet';
-import pinoHttp from 'pino-http';
+import { pinoHttp } from 'pino-http';
 import rateLimit from 'express-rate-limit';
 import { env } from '../config/env.js';
 import { logger } from '../utils/logger.js';
@@ -46,9 +46,19 @@ export function createApp() {
   app.use(
     pinoHttp({
       logger,
-      genReqId: (_req, res) => String(res.locals.correlationId),
+      genReqId: (_req, res) => {
+        const expressResponse = res as typeof res & {
+          locals?: {
+            correlationId?: unknown;
+          };
+        };
+
+        return String(
+          expressResponse.locals?.correlationId ?? '',
+        );
+      },
       serializers: {
-        req: (req) => ({ id: req.id, method: req.method, url: req.url.split('?')[0] }),
+        req: (req) => ({ id: req.id, method: req.method, url: req.url?.split('?')[0] }),
       },
     }),
   );

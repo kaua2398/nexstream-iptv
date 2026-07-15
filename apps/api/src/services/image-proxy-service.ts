@@ -38,7 +38,12 @@ export class ImageProxyService {
     });
     const contentType = String(response.headers['content-type'] ?? '');
     if (!contentType.startsWith('image/')) {
-      response.data.destroy();
+      const upstreamStream =
+        response.data as NodeJS.ReadableStream & {
+          destroy?: () => void;
+        };
+
+      upstreamStream.destroy?.();
       throw new AppError(415, 'INVALID_IMAGE', 'Formato de imagem inválido.');
     }
     res.setHeader('content-type', contentType);

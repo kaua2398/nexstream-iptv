@@ -14,8 +14,12 @@ function isBlockedIp(address: string): boolean {
     return true;
   }
 
-  if (parsed.kind() === 'ipv6' && parsed.isIPv4MappedAddress()) {
-    parsed = parsed.toIPv4Address();
+  if (parsed.kind() === 'ipv6') {
+    const parsedIpv6 = parsed as ipaddr.IPv6;
+
+    if (parsedIpv6.isIPv4MappedAddress()) {
+      parsed = parsedIpv6.toIPv4Address();
+    }
   }
 
   const range = parsed.range();

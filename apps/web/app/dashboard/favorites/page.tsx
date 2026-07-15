@@ -2,7 +2,7 @@
 
 import { useQuery } from '@tanstack/react-query';
 import type { MediaCardDto } from '@nexstream/shared';
-import { CatalogPage } from '@/components/media/catalog-page';
+import { StaticCatalogPage } from '@/components/media/static-catalog-page';
 import { api } from '@/services/api';
 
 interface FavoriteRow {
@@ -27,5 +27,5 @@ export default function FavoritesPage() {
     year: null,
     rating: null,
   }));
-  return <CatalogPage title="Favoritos" items={items} />;
+  return <StaticCatalogPage title="Favoritos" items={items} />;
 }
