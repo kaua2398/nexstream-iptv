@@ -19,7 +19,7 @@ const schema = z.object({
   IMAGE_TOKEN_ENCRYPTION_KEY_BASE64: keySchema,
   ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().min(60).max(900).default(600),
   REFRESH_TOKEN_TTL_SECONDS: z.coerce.number().int().min(3600).default(2_592_000),
-  PLAYBACK_TOKEN_TTL_SECONDS: z.coerce.number().int().min(60).max(300).default(180),
+  PLAYBACK_TOKEN_TTL_SECONDS: z.coerce.number().int().min(300).max(43_200).default(28_800),
   SESSION_IDLE_TTL_SECONDS: z.coerce.number().int().min(900).default(43_200),
   MAX_CONCURRENT_STREAMS: z.coerce.number().int().min(1).max(10).default(2),
   TRUSTED_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(1),

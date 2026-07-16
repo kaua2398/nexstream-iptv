@@ -59,6 +59,23 @@ export function MediaCard({ item }: { item: MediaCardDto }) {
           {item.rating != null && <span>★ {item.rating.toFixed(1)}</span>}
         </div>
       </div>
+      {typeof item.progress === 'number' &&
+        item.progress > 0 && (
+          <div className="absolute inset-x-0 bottom-0 h-1 bg-white/20">
+            <div
+              className="h-full bg-red-600"
+              style={{
+                width: `${Math.min(
+                  100,
+                  Math.max(
+                    0,
+                    item.progress * 100,
+                  ),
+                )}%`,
+              }}
+            />
+          </div>
+        )}
     </motion.button>
   );
 }

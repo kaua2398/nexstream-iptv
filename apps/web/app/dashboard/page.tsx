@@ -7,6 +7,7 @@ import { MediaRow } from '@/components/media/media-row';
 import { useCatalog } from '@/hooks/use-catalog';
 import { api } from '@/services/api';
 
+import { ContinueWatchingRow } from '@/components/media/continue-watching-row';
 interface HistoryRow {
   mediaId: string;
   mediaType: MediaCardDto['type'];
@@ -49,6 +50,7 @@ export default function DashboardPage() {
   return (
     <div className="space-y-10">
       <Hero item={data.movies[0] ?? data.live[0]} />
+      <ContinueWatchingRow />
       <MediaRow title="Continue assistindo" items={continueItems} />
       <MediaRow title="TV ao vivo" items={data.live.slice(0, 30)} />
       <MediaRow title="Filmes adicionados recentemente" items={data.movies.slice(0, 30)} />

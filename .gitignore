@@ -20,3 +20,5 @@ catalog-source-map.txt
 node_modules/
 .next/
 apps/web/.next/
+stream-travado*.log
+nexstream-streaming-consolidado/

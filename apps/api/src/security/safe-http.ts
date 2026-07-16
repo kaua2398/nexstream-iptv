@@ -1,3 +1,5 @@
+import { Agent as HttpAgent } from 'node:http';
+import { Agent as HttpsAgent } from 'node:https';
 import axios, {
   type AxiosRequestConfig,
   type AxiosResponse,
@@ -12,6 +14,22 @@ const redirectStatuses = new Set([
   307,
   308,
 ]);
+
+const httpAgent = new HttpAgent({
+  keepAlive: true,
+  keepAliveMsecs: 15_000,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+  scheduling: 'lifo',
+});
+
+const httpsAgent = new HttpsAgent({
+  keepAlive: true,
+  keepAliveMsecs: 15_000,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+  scheduling: 'lifo',
+});
 
 function disposeResponseBody(body: unknown): void {
   if (
@@ -49,16 +67,14 @@ export async function axiosGetWithValidatedRedirects<T>(
     redirectCount <= maxRedirects;
     redirectCount += 1
   ) {
-    /*
-     * Valida protocolo, hostname e todos os IPs
-     * resolvidos antes de cada conexão.
-     */
     const validated =
       await validatePublicHttpUrl(current);
 
     const response = await axios.get<T>(
       validated.url.toString(),
       {
+        httpAgent,
+        httpsAgent,
         ...config,
         maxRedirects: 0,
         validateStatus: (status) =>
@@ -99,10 +115,6 @@ export async function axiosGetWithValidatedRedirects<T>(
       validated.url,
     );
 
-    /*
-     * Impede que uma origem HTTPS redirecione silenciosamente
-     * para uma conexão HTTP sem criptografia.
-     */
     if (
       validated.url.protocol === 'https:' &&
       next.protocol === 'http:'

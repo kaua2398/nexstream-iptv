@@ -108,9 +108,31 @@ const episodeSchema = z
   .passthrough();
 
 function recordOrEmpty(value: unknown): Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : {};
+  if (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value)
+  ) {
+    return value as Record<string, unknown>;
+  }
+
+  if (typeof value === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(value);
+
+      if (
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        !Array.isArray(parsed)
+      ) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      return {};
+    }
+  }
+
+  return {};
 }
 
 function stringOrNull(value: unknown): string | null {
@@ -232,7 +254,8 @@ export class XtreamClient {
     const isLargeCatalog =
       action === 'get_live_streams' ||
       action === 'get_vod_streams' ||
-      action === 'get_series';
+      action === 'get_series' ||
+      action === 'get_series_info';
 
     const responseLimit = isLargeCatalog ? 64 * 1024 * 1024 : 10 * 1024 * 1024;
 
@@ -426,10 +449,26 @@ export class XtreamClient {
     userId: string,
     credentials: XtreamCredentials,
     type: BrowseCatalogType,
-  ): Promise<BrowseIndexedItem[]> {
-    const cacheKey = `browse-items-indexed:${userId}:${type}`;
-    const cached = this.cache.get<BrowseIndexedItem[]>(cacheKey);
-    if (cached) return cached;
+  ): Promise<
+    Array<{
+      providerCategoryId: string | null;
+      card: MediaCardDto;
+    }>
+  > {
+    const cacheKey =
+      `browse-items:${userId}:${type}:all`;
+
+    const cached =
+      this.cache.get<
+        Array<{
+          providerCategoryId: string | null;
+          card: MediaCardDto;
+        }>
+      >(cacheKey);
+
+    if (cached) {
+      return cached;
+    }
 
     const action =
       type === 'live'
@@ -438,41 +477,132 @@ export class XtreamClient {
           ? 'get_vod_streams'
           : 'get_series';
 
-    const response = await this.playerApi<unknown>(credentials, action);
-    const items: BrowseIndexedItem[] = [];
+    const response =
+      await this.playerApi<unknown>(
+        credentials,
+        action,
+      );
+
+    const deduplicated =
+      new Map<
+        string,
+        {
+          providerCategoryId: string | null;
+          card: MediaCardDto;
+        }
+      >();
 
     if (type === 'live') {
-      for (const item of z.array(liveSchema).catch([]).parse(response)) {
-        items.push({
-          card: this.liveCard(userId, item),
-          providerCategoryId:
-            item.category_id == null ? null : String(item.category_id),
-          addedAt: 0,
+      for (
+        const item of z
+          .array(liveSchema)
+          .catch([])
+          .parse(response)
+      ) {
+        const providerId =
+          String(item.stream_id);
+
+        if (deduplicated.has(providerId)) {
+          continue;
+        }
+
+        const providerCategoryId =
+          item.category_id == null
+            ? null
+            : String(item.category_id);
+
+        deduplicated.set(providerId, {
+          providerCategoryId,
+          card: {
+            id: this.opaqueIds.create({
+              userId,
+              type: 'live',
+              providerId,
+            }),
+            type: 'live',
+            title: item.name,
+            imageUrl:
+              safeImageUrl(item.stream_icon),
+            backdropUrl: null,
+            categoryId:
+              providerCategoryId == null
+                ? null
+                : this.opaqueIds.create({
+                    userId,
+                    type: 'category',
+                    providerId:
+                      JSON.stringify([
+                        providerCategoryId,
+                      ]),
+                  }),
+            year: null,
+            rating: null,
+          },
         });
       }
     } else if (type === 'movie') {
-      for (const item of z.array(movieSchema).catch([]).parse(response)) {
-        items.push({
-          card: this.movieCard(userId, item),
+      for (
+        const item of z
+          .array(movieSchema)
+          .catch([])
+          .parse(response)
+      ) {
+        const providerId =
+          String(item.stream_id);
+
+        if (deduplicated.has(providerId)) {
+          continue;
+        }
+
+        deduplicated.set(providerId, {
           providerCategoryId:
-            item.category_id == null ? null : String(item.category_id),
-          addedAt: numberFromUnknown(item.added) ?? 0,
+            item.category_id == null
+              ? null
+              : String(item.category_id),
+          card: this.movieCard(
+            userId,
+            item,
+          ),
         });
       }
     } else {
-      for (const item of z.array(seriesSchema).catch([]).parse(response)) {
-        items.push({
-          card: this.seriesCard(userId, item),
+      for (
+        const item of z
+          .array(seriesSchema)
+          .catch([])
+          .parse(response)
+      ) {
+        const providerId =
+          String(item.series_id);
+
+        if (deduplicated.has(providerId)) {
+          continue;
+        }
+
+        deduplicated.set(providerId, {
           providerCategoryId:
-            item.category_id == null ? null : String(item.category_id),
-          addedAt:
-            numberFromUnknown(item.last_modified ?? item.added) ?? 0,
+            item.category_id == null
+              ? null
+              : String(item.category_id),
+          card: this.seriesCard(
+            userId,
+            item,
+          ),
         });
       }
     }
 
-    items.sort((a, b) => b.addedAt - a.addedAt);
-    this.cache.set(cacheKey, items, 5 * 60_000);
+    const items =
+      [...deduplicated.values()];
+
+    this.cache.set(
+      cacheKey,
+      items,
+      type === 'live'
+        ? 5 * 60_000
+        : 15 * 60_000,
+    );
+
     return items;
   }
 
@@ -539,139 +669,671 @@ export class XtreamClient {
     credentials: XtreamCredentials,
     seriesId: string,
   ): Promise<SeriesDetailsDto> {
-    const payload = this.opaqueIds.parse(seriesId, userId);
-    if (payload.type !== 'series') {
-      throw new AppError(404, 'SERIES_NOT_FOUND', 'Série não encontrada.');
-    }
-
-    const cacheKey = `series-details:${userId}:${payload.providerId}`;
-    const cached = this.cache.get<SeriesDetailsDto>(cacheKey);
-    if (cached) return cached;
-
-    const raw = recordOrEmpty(
-      await this.playerApi<unknown>(credentials, 'get_series_info', {
-        series_id: payload.providerId,
-      }),
+    const payload = this.opaqueIds.parse(
+      seriesId,
+      userId,
     );
-    const info = recordOrEmpty(raw.info);
-    const seasonsRaw = Array.isArray(raw.seasons) ? raw.seasons : [];
-    const seasonMetadata = new Map<number, Record<string, unknown>>();
 
-    for (const season of seasonsRaw) {
-      const record = recordOrEmpty(season);
-      const seasonNumber = numberFromUnknown(
-        record.season_number ?? record.season ?? record.number,
+    if (payload.type !== 'series') {
+      throw new AppError(
+        404,
+        'SERIES_NOT_FOUND',
+        'Série não encontrada.',
       );
-      if (seasonNumber != null) seasonMetadata.set(seasonNumber, record);
     }
 
-    const episodeGroups = new Map<number, SeriesEpisodeDto[]>();
-    const episodesContainer = raw.episodes;
-    const entries: Array<[string, unknown]> = Array.isArray(episodesContainer)
-      ? [['1', episodesContainer]]
-      : Object.entries(recordOrEmpty(episodesContainer));
+    const cacheKey =
+      `series-details:${userId}:${payload.providerId}`;
 
-    for (const [seasonKey, value] of entries) {
-      if (!Array.isArray(value)) continue;
-      const fallbackSeason = numberFromUnknown(seasonKey) ?? 1;
+    const cached =
+      this.cache.get<SeriesDetailsDto>(cacheKey);
 
-      for (const episodeRaw of value) {
-        const parsed = episodeSchema.safeParse(episodeRaw);
-        if (!parsed.success) continue;
-        const episode = parsed.data;
-        const episodeInfo = recordOrEmpty(episode.info);
-        const seasonNumber =
-          numberFromUnknown(episode.season) ?? fallbackSeason;
-        const episodeNumber =
-          numberFromUnknown(episode.episode_num) ??
-          (episodeGroups.get(seasonNumber)?.length ?? 0) + 1;
-        const extension = episode.container_extension ?? 'mp4';
-        const image =
-          safeImageUrl(episodeInfo.movie_image) ??
-          safeImageUrl(episodeInfo.cover_big) ??
-          safeImageUrl(episodeInfo.cover);
+    if (cached && cached.seasons.length > 0) {
+      return cached;
+    }
 
-        const mapped: SeriesEpisodeDto = {
-          id: this.opaqueIds.create({
-            userId,
-            type: 'episode',
-            providerId: String(episode.id),
-            extension,
-          }),
-          title:
-            stringOrNull(episode.title) ??
-            `Episódio ${episodeNumber}`,
-          episodeNumber,
+    const response =
+      await this.playerApi<unknown>(
+        credentials,
+        'get_series_info',
+        {
+          series_id: payload.providerId,
+        },
+      );
+
+    const responseRecord =
+      recordOrEmpty(response);
+
+    const dataRecord =
+      recordOrEmpty(responseRecord.data);
+
+    const resultRecord =
+      recordOrEmpty(responseRecord.result);
+
+    const raw: Record<string, unknown> = {
+      ...responseRecord,
+      ...resultRecord,
+      ...dataRecord,
+    };
+
+    const infoCandidate =
+      recordOrEmpty(
+        raw.info ??
+          raw.series_info ??
+          raw.seriesInfo,
+      );
+
+    const info =
+      Object.keys(infoCandidate).length > 0
+        ? infoCandidate
+        : raw;
+
+    const parseUnknownArray = (
+      value: unknown,
+    ): unknown[] => {
+      if (Array.isArray(value)) {
+        return value;
+      }
+
+      if (typeof value === 'string') {
+        try {
+          const parsed: unknown =
+            JSON.parse(value);
+
+          return Array.isArray(parsed)
+            ? parsed
+            : [];
+        } catch {
+          return [];
+        }
+      }
+
+      return [];
+    };
+
+    const firstImage = (
+      value: unknown,
+    ): string | null => {
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          const image = safeImageUrl(item);
+
+          if (image) {
+            return image;
+          }
+        }
+
+        return null;
+      }
+
+      const direct = safeImageUrl(value);
+
+      if (direct) {
+        return direct;
+      }
+
+      if (typeof value === 'string') {
+        try {
+          const parsed: unknown =
+            JSON.parse(value);
+
+          if (Array.isArray(parsed)) {
+            for (const item of parsed) {
+              const image = safeImageUrl(item);
+
+              if (image) {
+                return image;
+              }
+            }
+          }
+        } catch {
+          return null;
+        }
+      }
+
+      return null;
+    };
+
+    const seasonMetadata =
+      new Map<number, Record<string, unknown>>();
+
+    const registerSeason = (
+      value: unknown,
+      fallbackSeason?: number,
+    ) => {
+      const record = recordOrEmpty(value);
+
+      const seasonNumber =
+        numberFromUnknown(
+          record.season_number ??
+            record.season ??
+            record.number,
+        ) ??
+        fallbackSeason ??
+        null;
+
+      if (seasonNumber != null) {
+        seasonMetadata.set(
           seasonNumber,
-          imageUrl: image,
-          plot:
-            stringOrNull(episodeInfo.plot) ??
-            stringOrNull(episodeInfo.description),
-          durationSeconds:
-            durationToSeconds(episodeInfo.duration_secs) ??
-            durationToSeconds(episodeInfo.duration),
-          rating: numberFromUnknown(episodeInfo.rating),
-          releaseDate:
-            stringOrNull(episodeInfo.releasedate) ??
-            stringOrNull(episodeInfo.release_date),
-        };
+          record,
+        );
+      }
+    };
 
-        const group = episodeGroups.get(seasonNumber) ?? [];
-        group.push(mapped);
-        episodeGroups.set(seasonNumber, group);
+    const seasonsContainer =
+      raw.seasons ??
+      raw.season_list ??
+      raw.seasonList;
+
+    const seasonsArray =
+      parseUnknownArray(seasonsContainer);
+
+    if (seasonsArray.length > 0) {
+      for (const season of seasonsArray) {
+        registerSeason(season);
+      }
+    } else {
+      for (
+        const [seasonKey, seasonValue]
+        of Object.entries(
+          recordOrEmpty(seasonsContainer),
+        )
+      ) {
+        registerSeason(
+          seasonValue,
+          numberFromUnknown(seasonKey) ?? undefined,
+        );
       }
     }
 
-    const seasons: SeriesSeasonDto[] = [...episodeGroups.entries()]
-      .sort(([a], [b]) => a - b)
-      .map(([seasonNumber, episodes]) => {
-        const metadata = seasonMetadata.get(seasonNumber) ?? {};
-        episodes.sort((a, b) => a.episodeNumber - b.episodeNumber);
+    interface EpisodeCandidate {
+      record: Record<string, unknown>;
+      fallbackSeason: number;
+    }
 
-        return {
-          seasonNumber,
-          name:
-            stringOrNull(metadata.name) ??
-            `Temporada ${seasonNumber}`,
-          coverUrl:
-            safeImageUrl(metadata.cover_big) ??
-            safeImageUrl(metadata.cover),
-          episodes,
-        };
-      });
+    const episodeCandidates: EpisodeCandidate[] = [];
 
-    const backdropRaw = info.backdrop_path;
-    const backdrop = Array.isArray(backdropRaw)
-      ? backdropRaw[0]
-      : backdropRaw;
+    const pushEpisodeCollection = (
+      value: unknown,
+      fallbackSeason: number,
+      assumeEpisodeItems = false,
+    ): void => {
+      if (typeof value === 'string') {
+        try {
+          const parsed: unknown =
+            JSON.parse(value);
+
+          pushEpisodeCollection(
+            parsed,
+            fallbackSeason,
+            assumeEpisodeItems,
+          );
+        } catch {
+          return;
+        }
+
+        return;
+      }
+
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          const record = recordOrEmpty(item);
+
+          const nestedEpisodes =
+            record.episodes ??
+            record.episode_list ??
+            record.episodeList ??
+            record.items;
+
+          const nestedSeason =
+            numberFromUnknown(
+              record.season_number ??
+                record.season ??
+                record.number,
+            ) ??
+            fallbackSeason;
+
+          if (nestedEpisodes != null) {
+            registerSeason(
+              record,
+              nestedSeason,
+            );
+
+            pushEpisodeCollection(
+              nestedEpisodes,
+              nestedSeason,
+              true,
+            );
+
+            continue;
+          }
+
+          const providerId =
+            record.id ??
+            record.episode_id ??
+            record.episodeId ??
+            record.stream_id ??
+            record.streamId;
+
+          const looksLikeEpisode =
+            providerId != null &&
+            (
+              assumeEpisodeItems ||
+              record.episode_num != null ||
+              record.episode_number != null ||
+              record.episodeNumber != null ||
+              record.container_extension != null ||
+              record.info != null ||
+              record.title != null
+            );
+
+          if (looksLikeEpisode) {
+            episodeCandidates.push({
+              record,
+              fallbackSeason: nestedSeason,
+            });
+          }
+        }
+
+        return;
+      }
+
+      const record = recordOrEmpty(value);
+
+      if (Object.keys(record).length === 0) {
+        return;
+      }
+
+      const nestedEpisodes =
+        record.episodes ??
+        record.episode_list ??
+        record.episodeList ??
+        record.items;
+
+      if (nestedEpisodes != null) {
+        const nestedSeason =
+          numberFromUnknown(
+            record.season_number ??
+              record.season ??
+              record.number,
+          ) ??
+          fallbackSeason;
+
+        registerSeason(
+          record,
+          nestedSeason,
+        );
+
+        pushEpisodeCollection(
+          nestedEpisodes,
+          nestedSeason,
+          true,
+        );
+
+        return;
+      }
+
+      const providerId =
+        record.id ??
+        record.episode_id ??
+        record.episodeId ??
+        record.stream_id ??
+        record.streamId;
+
+      if (providerId != null && assumeEpisodeItems) {
+        episodeCandidates.push({
+          record,
+          fallbackSeason,
+        });
+
+        return;
+      }
+
+      for (
+        const [key, child]
+        of Object.entries(record)
+      ) {
+        const numericSeason =
+          numberFromUnknown(key);
+
+        if (
+          numericSeason != null ||
+          Array.isArray(child) ||
+          typeof child === 'string'
+        ) {
+          pushEpisodeCollection(
+            child,
+            numericSeason ?? fallbackSeason,
+            true,
+          );
+        }
+      }
+    };
+
+    const episodesContainer =
+      raw.episodes ??
+      raw.episode_list ??
+      raw.episodeList ??
+      raw.episode ??
+      raw.items;
+
+    pushEpisodeCollection(
+      episodesContainer,
+      1,
+      true,
+    );
+
+    for (const seasonValue of seasonsArray) {
+      const seasonRecord =
+        recordOrEmpty(seasonValue);
+
+      const nestedEpisodes =
+        seasonRecord.episodes ??
+        seasonRecord.episode_list ??
+        seasonRecord.episodeList ??
+        seasonRecord.items;
+
+      if (nestedEpisodes == null) {
+        continue;
+      }
+
+      const seasonNumber =
+        numberFromUnknown(
+          seasonRecord.season_number ??
+            seasonRecord.season ??
+            seasonRecord.number,
+        ) ??
+        1;
+
+      pushEpisodeCollection(
+        nestedEpisodes,
+        seasonNumber,
+        true,
+      );
+    }
+
+    for (
+      const [key, value]
+      of Object.entries(raw)
+    ) {
+      if (!/^\d+$/.test(key)) {
+        continue;
+      }
+
+      pushEpisodeCollection(
+        value,
+        Number(key),
+        true,
+      );
+    }
+
+    const episodeGroups =
+      new Map<number, SeriesEpisodeDto[]>();
+
+    const seenEpisodeIds =
+      new Set<string>();
+
+    for (const candidate of episodeCandidates) {
+      const episode = candidate.record;
+
+      const providerIdValue =
+        episode.id ??
+        episode.episode_id ??
+        episode.episodeId ??
+        episode.stream_id ??
+        episode.streamId;
+
+      if (providerIdValue == null) {
+        continue;
+      }
+
+      const providerId =
+        String(providerIdValue).trim();
+
+      if (
+        !providerId ||
+        seenEpisodeIds.has(providerId)
+      ) {
+        continue;
+      }
+
+      seenEpisodeIds.add(providerId);
+
+      const episodeInfo =
+        recordOrEmpty(
+          episode.info ??
+            episode.episode_info ??
+            episode.episodeInfo ??
+            episode.metadata,
+        );
+
+      const seasonNumber =
+        numberFromUnknown(
+          episode.season ??
+            episode.season_number ??
+            episode.seasonNumber ??
+            episodeInfo.season ??
+            episodeInfo.season_number,
+        ) ??
+        candidate.fallbackSeason;
+
+      const currentGroup =
+        episodeGroups.get(seasonNumber) ?? [];
+
+      const episodeNumber =
+        numberFromUnknown(
+          episode.episode_num ??
+            episode.episode_number ??
+            episode.episodeNumber ??
+            episode.num ??
+            episode.number ??
+            episodeInfo.episode_num ??
+            episodeInfo.episode_number,
+        ) ??
+        currentGroup.length + 1;
+
+      const extension =
+        stringOrNull(
+          episode.container_extension ??
+            episode.extension ??
+            episode.ext,
+        ) ??
+        'mp4';
+
+      const image =
+        firstImage(
+          episodeInfo.movie_image ??
+            episodeInfo.cover_big ??
+            episodeInfo.cover ??
+            episodeInfo.image ??
+            episode.movie_image ??
+            episode.cover_big ??
+            episode.cover ??
+            episode.image,
+        );
+
+      const mapped: SeriesEpisodeDto = {
+        id: this.opaqueIds.create({
+          userId,
+          type: 'episode',
+          providerId,
+          extension,
+        }),
+        title:
+          stringOrNull(
+            episode.title ??
+              episode.name ??
+              episodeInfo.title ??
+              episodeInfo.name,
+          ) ??
+          `Episódio ${episodeNumber}`,
+        episodeNumber,
+        seasonNumber,
+        imageUrl: image,
+        plot:
+          stringOrNull(
+            episodeInfo.plot ??
+              episodeInfo.description ??
+              episode.plot ??
+              episode.description,
+          ),
+        durationSeconds:
+          durationToSeconds(
+            episodeInfo.duration_secs ??
+              episodeInfo.duration_seconds ??
+              episodeInfo.duration ??
+              episode.duration_secs ??
+              episode.duration,
+          ),
+        rating:
+          numberFromUnknown(
+            episodeInfo.rating ??
+              episodeInfo.rating_5based ??
+              episode.rating,
+          ),
+        releaseDate:
+          stringOrNull(
+            episodeInfo.releasedate ??
+              episodeInfo.release_date ??
+              episodeInfo.air_date ??
+              episode.releasedate ??
+              episode.release_date ??
+              episode.air_date,
+          ),
+      };
+
+      currentGroup.push(mapped);
+      episodeGroups.set(
+        seasonNumber,
+        currentGroup,
+      );
+    }
+
+    const allSeasonNumbers =
+      new Set<number>([
+        ...seasonMetadata.keys(),
+        ...episodeGroups.keys(),
+      ]);
+
+    const seasons: SeriesSeasonDto[] =
+      [...allSeasonNumbers]
+        .sort((a, b) => a - b)
+        .map((seasonNumber) => {
+          const metadata =
+            seasonMetadata.get(seasonNumber) ?? {};
+
+          const episodes =
+            episodeGroups.get(seasonNumber) ?? [];
+
+          episodes.sort(
+            (a, b) =>
+              a.episodeNumber -
+              b.episodeNumber,
+          );
+
+          return {
+            seasonNumber,
+            name:
+              stringOrNull(
+                metadata.name ??
+                  metadata.title,
+              ) ??
+              `Temporada ${seasonNumber}`,
+            coverUrl:
+              firstImage(
+                metadata.cover_big ??
+                  metadata.cover ??
+                  metadata.image,
+              ),
+            episodes,
+          };
+        })
+        .filter(
+          (season) =>
+            season.episodes.length > 0,
+        );
+
     const release =
-      stringOrNull(info.releaseDate) ??
-      stringOrNull(info.release_date) ??
-      stringOrNull(info.releasedate);
+      stringOrNull(
+        info.releaseDate ??
+          info.release_date ??
+          info.releasedate ??
+          info.air_date,
+      );
 
     const result: SeriesDetailsDto = {
       id: seriesId,
       title:
-        stringOrNull(info.name) ??
-        stringOrNull(info.title) ??
+        stringOrNull(
+          info.name ??
+            info.title ??
+            raw.name ??
+            raw.title,
+        ) ??
         'Série sem nome',
       plot:
-        stringOrNull(info.plot) ??
-        stringOrNull(info.description),
+        stringOrNull(
+          info.plot ??
+            info.description ??
+            raw.plot ??
+            raw.description,
+        ),
       coverUrl:
-        safeImageUrl(info.cover) ??
-        safeImageUrl(info.cover_big),
-      backdropUrl: safeImageUrl(backdrop),
-      year: release?.slice(0, 4) ?? null,
-      rating: numberFromUnknown(info.rating),
-      genre: stringOrNull(info.genre),
-      cast: stringOrNull(info.cast),
-      director: stringOrNull(info.director),
-      durationMinutes: numberFromUnknown(info.episode_run_time),
+        firstImage(
+          info.cover ??
+            info.cover_big ??
+            raw.cover ??
+            raw.cover_big,
+        ),
+      backdropUrl:
+        firstImage(
+          info.backdrop_path ??
+            info.backdrop ??
+            raw.backdrop_path ??
+            raw.backdrop,
+        ),
+      year:
+        release?.slice(0, 4) ??
+        (
+          info.year != null
+            ? String(info.year).slice(0, 4)
+            : null
+        ),
+      rating:
+        numberFromUnknown(
+          info.rating ??
+            info.rating_5based,
+        ),
+      genre:
+        stringOrNull(
+          info.genre ??
+            info.genres,
+        ),
+      cast:
+        stringOrNull(
+          info.cast ??
+            info.actors,
+        ),
+      director:
+        stringOrNull(
+          info.director,
+        ),
+      durationMinutes:
+        numberFromUnknown(
+          info.episode_run_time ??
+            info.duration_minutes,
+        ),
       seasons,
     };
 
-    this.cache.set(cacheKey, result, 5 * 60_000);
+    this.cache.set(
+      cacheKey,
+      result,
+      seasons.length > 0
+        ? 15 * 60_000
+        : 10_000,
+    );
+
     return result;
   }
 

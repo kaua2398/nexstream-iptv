@@ -6,12 +6,24 @@ import { requireCsrf } from '../middlewares/csrf.js';
 import type { AuthenticatedRequest } from '../types.js';
 import type { OpaqueIdService } from '../security/opaque-id.js';
 
+const libraryImageUrlSchema = z
+  .string()
+  .trim()
+  .max(2048)
+  .refine(
+    (value) =>
+      /^https?:\/\//i.test(value) ||
+      value.startsWith('/'),
+    'Imagem inválida.',
+  )
+  .nullable()
+  .optional();
 const favoriteSchema = z
   .object({
     mediaId: z.string().min(20).max(4096),
     mediaType: z.enum(['live', 'movie', 'series', 'episode']),
     title: z.string().trim().min(1).max(300),
-    imageUrl: z.string().url().max(2048).nullable().optional(),
+    imageUrl: libraryImageUrlSchema,
   })
   .strict();
 

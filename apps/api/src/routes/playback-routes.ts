@@ -7,31 +7,88 @@ import { requireCsrf } from '../middlewares/csrf.js';
 import type { AuthenticatedRequest } from '../types.js';
 import { AppError } from '../utils/errors.js';
 
-export function playbackRoutes(db: PrismaClient, playback: PlaybackService): Router {
+export function playbackRoutes(
+  db: PrismaClient,
+  playback: PlaybackService,
+): Router {
   const router = Router();
-  const tokenLimiter = rateLimit({ windowMs: 60_000, limit: 30, legacyHeaders: false });
-  router.use(requireAuth(db));
 
-  router.post('/token', tokenLimiter, requireCsrf, async (req, res) => {
-    const auth = (req as unknown as AuthenticatedRequest).auth;
-    res.json(await playback.issue(auth.userId, auth.sessionId, req.body));
+  const tokenLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 30,
+    legacyHeaders: false,
   });
 
+  /*
+   * Só a emissão do token exige o access token normal.
+   * O elemento <video> não consegue renovar esse access token
+   * quando ele expira. Os endpoints de mídia usam o próprio
+   * playback token, que é aleatório, expira e permanece ligado
+   * à sessão armazenada no banco.
+   */
+  router.post(
+    '/token',
+    tokenLimiter,
+    requireAuth(db),
+    requireCsrf,
+    async (req, res) => {
+      const auth =
+        (req as unknown as AuthenticatedRequest)
+          .auth;
+
+      res.json(
+        await playback.issue(
+          auth.userId,
+          auth.sessionId,
+          req.body,
+        ),
+      );
+    },
+  );
+
   router.get('/stream/:token', async (req, res) => {
-    const auth = (req as unknown as AuthenticatedRequest).auth;
     const token = req.params.token;
-    if (!token) throw new AppError(400, 'TOKEN_REQUIRED', 'Token obrigatório.');
-    await playback.stream(req, res, auth, token);
+
+    if (!token) {
+      throw new AppError(
+        400,
+        'TOKEN_REQUIRED',
+        'Token obrigatório.',
+      );
+    }
+
+    await playback.stream(
+      req,
+      res,
+      token,
+    );
   });
 
   router.get('/segment', async (req, res) => {
-    const auth = (req as unknown as AuthenticatedRequest).auth;
-    const playbackToken = typeof req.query.playback === 'string' ? req.query.playback : '';
-    const resourceToken = typeof req.query.resource === 'string' ? req.query.resource : '';
+    const playbackToken =
+      typeof req.query.playback === 'string'
+        ? req.query.playback
+        : '';
+
+    const resourceToken =
+      typeof req.query.resource === 'string'
+        ? req.query.resource
+        : '';
+
     if (!playbackToken || !resourceToken) {
-      throw new AppError(400, 'RESOURCE_TOKEN_REQUIRED', 'Recurso inválido.');
+      throw new AppError(
+        400,
+        'RESOURCE_TOKEN_REQUIRED',
+        'Recurso inválido.',
+      );
     }
-    await playback.segment(req, res, auth, playbackToken, resourceToken);
+
+    await playback.segment(
+      req,
+      res,
+      playbackToken,
+      resourceToken,
+    );
   });
 
   return router;
