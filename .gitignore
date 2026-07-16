@@ -22,3 +22,4 @@ node_modules/
 apps/web/.next/
 stream-travado*.log
 nexstream-streaming-consolidado/
+*.tsbuildinfo
