@@ -4,6 +4,7 @@ import Hls from 'hls.js';
 import {
   ArrowLeft,
   Maximize,
+  Maximize2,
   Minimize2,
   Pause,
   PictureInPicture,
@@ -55,6 +56,10 @@ export function VideoPlayer() {
     setMinimized,
   } = usePlayerStore();
 
+  const playerContainerRef =
+
+    useRef<HTMLDivElement>(null);
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
 
@@ -62,6 +67,8 @@ export function VideoPlayer() {
     useState<PlaybackTicket | null>(null);
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
+  const [isFullscreen, setIsFullscreen] =
+    useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [buffered, setBuffered] = useState(0);
@@ -81,6 +88,48 @@ export function VideoPlayer() {
     if (!canSeek) return 0;
     return Math.min(100, Math.max(0, (buffered / duration) * 100));
   }, [buffered, canSeek, duration]);
+  const toggleFullscreen = useCallback(async () => {
+    const container = playerContainerRef.current;
+
+    if (!container) {
+      return;
+    }
+
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      } else {
+        await container.requestFullscreen();
+      }
+
+      setError(null);
+    } catch {
+      setError(
+        'Não foi possível ativar a tela cheia.',
+      );
+    }
+  }, []);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(
+        document.fullscreenElement ===
+          playerContainerRef.current,
+      );
+    };
+
+    document.addEventListener(
+      'fullscreenchange',
+      handleFullscreenChange,
+    );
+
+    return () => {
+      document.removeEventListener(
+        'fullscreenchange',
+        handleFullscreenChange,
+      );
+    };
+  }, []);
 
   const playSafely = useCallback(async () => {
     const video = videoRef.current;
@@ -286,9 +335,7 @@ export function VideoPlayer() {
       }
 
       if (event.key.toLowerCase() === 'f') {
-        void video.requestFullscreen().catch(() => {
-          setError('Não foi possível ativar a tela cheia.');
-        });
+        void toggleFullscreen();
       }
 
       if (event.key === 'Escape') {
@@ -312,6 +359,7 @@ export function VideoPlayer() {
 
   return (
     <div
+      ref={playerContainerRef}
       className={
         minimized
           ? 'fixed bottom-5 right-5 z-50 aspect-video w-[min(420px,calc(100vw-2.5rem))] overflow-hidden rounded-2xl border bg-black shadow-glow'
@@ -476,6 +524,28 @@ export function VideoPlayer() {
             <p className="ml-1 min-w-0 flex-1 truncate text-sm font-semibold">
               {media.title}
             </p>
+          <button
+            type="button"
+            aria-label={
+              isFullscreen
+                ? 'Sair da tela cheia'
+                : 'Tela cheia'
+            }
+            title={
+              isFullscreen
+                ? 'Sair da tela cheia'
+                : 'Tela cheia'
+            }
+            onClick={() => {
+              void toggleFullscreen();
+            }}
+          >
+            {isFullscreen ? (
+              <Minimize2 className="size-5" />
+            ) : (
+              <Maximize2 className="size-5" />
+            )}
+          </button>
 
             <button
               type="button"
