@@ -1,4 +1,5 @@
 import { once } from 'node:events';
+import { isAxiosError } from 'axios';
 import type { Readable } from 'node:stream';
 import type { Request, Response } from 'express';
 import type { PrismaClient } from '@prisma/client';
@@ -168,7 +169,21 @@ export class PlaybackService {
     await this.proxyBinary(
       req,
       res,
-      upstream,
+      async () =>
+        this.xtream.streamUrl(
+          credentials,
+          {
+            type:
+              media.type as
+                | 'live'
+                | 'movie'
+                | 'episode',
+            providerId: media.providerId,
+            ...(media.extension
+              ? { extension: media.extension }
+              : {}),
+          },
+        ),
       {
         forceRange:
           media.type === 'movie' ||
@@ -177,6 +192,8 @@ export class PlaybackService {
           media.type === 'live'
             ? 5
             : 120,
+        maxAttempts: 7,
+        upstreamIdleTimeoutMs: 18_000,
       },
     );
   }
@@ -329,10 +346,12 @@ export class PlaybackService {
     await this.proxyBinary(
       req,
       res,
-      target.url,
+      async () => target.url,
       {
         forceRange: false,
         cacheSeconds: 30,
+        maxAttempts: 5,
+        upstreamIdleTimeoutMs: 15_000,
       },
     );
   }
@@ -340,496 +359,316 @@ export class PlaybackService {
   private async proxyBinary(
     req: Request,
     res: Response,
-    upstream: URL,
+    resolveUpstream: () => Promise<URL>,
     options: {
       forceRange: boolean;
       cacheSeconds: number;
+      maxAttempts: number;
+      upstreamIdleTimeoutMs: number;
     },
   ): Promise<void> {
-    const maxChunkBytes =
-      64 * 1024 * 1024;
+    const maxChunkBytes = 64 * 1024 * 1024;
+    const requestedRange = req.header('range');
+    const ifRange = req.header('if-range');
 
-    const requestedRange =
-      req.header('range');
-
-    const ifRange =
-      req.header('if-range');
-
-    if (
-      requestedRange &&
-      !/^bytes=\d*-\d*$/.test(
-        requestedRange,
-      )
-    ) {
-      throw new AppError(
-        416,
-        'INVALID_RANGE',
-        'Intervalo de mídia inválido.',
-      );
+    if (requestedRange && !/^bytes=\d*-\d*$/.test(requestedRange)) {
+      throw new AppError(416, 'INVALID_RANGE', 'Intervalo de mídia inválido.');
     }
 
-    let requestedStart:
-      | number
-      | null = null;
+    const match = requestedRange
+      ? /^bytes=(\d*)-(\d*)$/.exec(requestedRange)
+      : null;
 
-    let requestedEnd:
-      | number
-      | null = null;
+    let requestedStart: number | null = null;
+    let requestedEnd: number | null = null;
+    let suffixLength: number | null = null;
 
-    let upstreamRange =
-      requestedRange;
-
-    const rangeMatch =
-      requestedRange
-        ? /^bytes=(\d*)-(\d*)$/.exec(
-            requestedRange,
-          )
-        : null;
-
-    if (rangeMatch?.[1]) {
-      requestedStart =
-        Number(rangeMatch[1]);
-
-      requestedEnd =
-        rangeMatch[2]
-          ? Number(rangeMatch[2])
-          : null;
+    if (match?.[1]) {
+      requestedStart = Number(match[1]);
+      requestedEnd = match[2] ? Number(match[2]) : null;
 
       if (
-        !Number.isSafeInteger(
-          requestedStart,
-        ) ||
+        !Number.isSafeInteger(requestedStart) ||
         requestedStart < 0 ||
-        (
-          requestedEnd != null &&
-          (
-            !Number.isSafeInteger(
-              requestedEnd,
-            ) ||
-            requestedEnd <
-              requestedStart
-          )
-        )
+        (requestedEnd != null &&
+          (!Number.isSafeInteger(requestedEnd) || requestedEnd < requestedStart))
       ) {
-        throw new AppError(
-          416,
-          'INVALID_RANGE',
-          'Intervalo de mídia inválido.',
-        );
+        throw new AppError(416, 'INVALID_RANGE', 'Intervalo de mídia inválido.');
       }
-
-      const cappedEnd =
-        Math.min(
-          requestedEnd ??
-            Number.MAX_SAFE_INTEGER,
-          requestedStart +
-            maxChunkBytes -
-            1,
-        );
-
-      upstreamRange =
-        `bytes=${requestedStart}-${cappedEnd}`;
-    } else if (
-      rangeMatch?.[2]
-    ) {
-      const suffixLength =
-        Number(rangeMatch[2]);
-
-      if (
-        !Number.isSafeInteger(
-          suffixLength,
-        ) ||
-        suffixLength <= 0
-      ) {
-        throw new AppError(
-          416,
-          'INVALID_RANGE',
-          'Intervalo de mídia inválido.',
-        );
+    } else if (match?.[2]) {
+      suffixLength = Number(match[2]);
+      if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) {
+        throw new AppError(416, 'INVALID_RANGE', 'Intervalo de mídia inválido.');
       }
-
-      upstreamRange =
-        `bytes=-${Math.min(
-          suffixLength,
-          maxChunkBytes,
-        )}`;
-    } else if (
-      options.forceRange
-    ) {
+      suffixLength = Math.min(suffixLength, maxChunkBytes);
+    } else if (options.forceRange) {
       requestedStart = 0;
-      requestedEnd =
-        maxChunkBytes - 1;
-
-      upstreamRange =
-        `bytes=0-${requestedEnd}`;
+      requestedEnd = maxChunkBytes - 1;
     }
 
     req.setTimeout(0);
     res.setTimeout(0);
 
-    const {
-      response,
-    } =
-      await axiosGetWithValidatedRedirects<Readable>(
-        upstream,
-        {
-          responseType: 'stream',
-          timeout:
-            options.forceRange
-              ? 0
-              : 30_000,
-          maxBodyLength:
-            Number.POSITIVE_INFINITY,
-          maxContentLength:
-            Number.POSITIVE_INFINITY,
-          decompress: false,
-          headers: {
-            'User-Agent':
-              'NexStream/0.1',
-            Accept: '*/*',
-            'Accept-Encoding':
-              'identity',
-            Connection:
-              'keep-alive',
-            ...(upstreamRange
-              ? {
-                  Range:
-                    upstreamRange,
-                }
-              : {}),
-            ...(ifRange
-              ? {
-                  'If-Range':
-                    ifRange,
-                }
-              : {}),
-          },
-        },
-      );
+    let bytesSent = 0;
+    let outputLength: number | null = null;
+    let outputStart: number | null = null;
+    let outputEnd: number | null = null;
+    let outputTotal: number | null = null;
+    let headersSent = false;
+    let attempt = 0;
+    let lastError: unknown = null;
 
-    const contentRangeHeader =
-      typeof response.headers[
-        'content-range'
-      ] === 'string'
-        ? response.headers[
-            'content-range'
-          ]
-        : null;
-
-    const contentRangeMatch =
-      contentRangeHeader
-        ? /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(
-            contentRangeHeader,
-          )
-        : null;
-
-    const upstreamLength =
-      Number(
-        response.headers[
-          'content-length'
-        ],
-      );
-
-    let outputStatus =
-      response.status;
-
-    let outputStart:
-      | number
-      | null =
-        contentRangeMatch
-          ? Number(
-              contentRangeMatch[1],
-            )
-          : null;
-
-    let outputEnd:
-      | number
-      | null =
-        contentRangeMatch
-          ? Number(
-              contentRangeMatch[2],
-            )
-          : null;
-
-    let outputTotal:
-      | number
-      | null =
-        contentRangeMatch &&
-        contentRangeMatch[3] !== '*'
-          ? Number(
-              contentRangeMatch[3],
-            )
-          : null;
-
-    let outputLength:
-      | number
-      | null =
-        Number.isSafeInteger(
-          upstreamLength,
-        ) &&
-        upstreamLength >= 0
-          ? upstreamLength
-          : null;
-
-    if (
-      options.forceRange &&
-      response.status === 200 &&
-      requestedStart != null &&
-      requestedStart > 0
-    ) {
-      response.data.destroy();
-
-      throw new AppError(
-        502,
-        'UPSTREAM_RANGE_UNSUPPORTED',
-        'O servidor de mídia não aceitou continuar deste ponto.',
-      );
-    }
-
-    if (
-      options.forceRange &&
-      response.status === 200 &&
-      requestedStart === 0 &&
-      outputLength != null
-    ) {
-      outputStatus = 206;
-      outputStart = 0;
-      outputTotal =
-        outputLength;
-      outputEnd =
-        Math.min(
-          outputLength - 1,
-          maxChunkBytes - 1,
-        );
-      outputLength =
-        outputEnd + 1;
-    } else if (
-      response.status === 206 &&
-      outputStart != null &&
-      outputEnd != null
-    ) {
-      if (
-        options.forceRange &&
-        requestedStart != null &&
-        outputStart !== requestedStart
-      ) {
-        response.data.destroy();
-
-        throw new AppError(
-          502,
-          'INVALID_UPSTREAM_RANGE_START',
-          'O servidor de mídia respondeu a partir de um ponto incorreto.',
-        );
-      }
-
-      outputEnd =
-        Math.min(
-          outputEnd,
-          requestedEnd ??
-            Number.MAX_SAFE_INTEGER,
-          outputStart +
-            maxChunkBytes -
-            1,
-        );
-
-      outputLength =
-        outputEnd -
-        outputStart +
-        1;
-    }
-
-    if (
-      options.forceRange &&
-      outputStatus !== 206
-    ) {
-      response.data.destroy();
-
-      throw new AppError(
-        502,
-        'INVALID_UPSTREAM_RANGE',
-        'O servidor de mídia enviou uma resposta de intervalo inválida.',
-      );
-    }
-
-    res.status(outputStatus);
-
-    const contentType =
-      response.headers[
-        'content-type'
-      ];
-
-    if (contentType) {
-      res.setHeader(
-        'content-type',
-        contentType,
-      );
-    }
-
-    for (
-      const header of [
-        'etag',
-        'last-modified',
-        'content-disposition',
-      ]
-    ) {
-      const value =
-        response.headers[header];
-
-      if (value != null) {
-        res.setHeader(
-          header,
-          value,
-        );
-      }
-    }
-
-    if (outputLength != null) {
-      res.setHeader(
-        'content-length',
-        String(outputLength),
-      );
-    }
-
-    if (
-      outputStatus === 206 &&
-      outputStart != null &&
-      outputEnd != null
-    ) {
-      res.setHeader(
-        'content-range',
-        `bytes ${outputStart}-${outputEnd}/${outputTotal ?? '*'}`,
-      );
-
-      res.setHeader(
-        'accept-ranges',
-        'bytes',
-      );
-    } else if (
-      requestedRange ||
-      options.forceRange
-    ) {
-      res.setHeader(
-        'accept-ranges',
-        'bytes',
-      );
-    }
-
-    res.setHeader(
-      'cache-control',
-      options.cacheSeconds > 0
-        ? `private, max-age=${options.cacheSeconds}`
-        : 'private, no-store',
-    );
-
-    res.setHeader(
-      'x-accel-buffering',
-      'no',
-    );
-
-    res.flushHeaders();
-
-    const upstreamStream =
-      response.data;
-
-    let completed = false;
-
-    const abortUpstream = () => {
-      if (!completed) {
-        upstreamStream.destroy();
-      }
+    const retryDelay = async (currentAttempt: number): Promise<void> => {
+      const delay = Math.min(4_000, 350 * 2 ** Math.max(0, currentAttempt - 1));
+      await new Promise<void>((resolve) => setTimeout(resolve, delay));
     };
 
-    req.once(
-      'aborted',
-      abortUpstream,
-    );
+    const isRetryable = (error: unknown): boolean => {
+      if (!isAxiosError(error)) return true;
+      const status = error.response?.status;
+      if (status != null) {
+        return [404, 408, 409, 425, 429, 500, 502, 503, 504].includes(status);
+      }
+      return [
+        'ECONNRESET',
+        'ECONNABORTED',
+        'ETIMEDOUT',
+        'EPIPE',
+        'ENETUNREACH',
+        'EHOSTUNREACH',
+        'UND_ERR_SOCKET',
+      ].includes(error.code ?? '');
+    };
 
-    res.once(
-      'close',
-      abortUpstream,
-    );
+    while (attempt < options.maxAttempts) {
+      attempt += 1;
+      let upstreamStream: Readable | null = null;
+      let clientClosed = false;
 
-    let remaining =
-      outputLength;
+      const abortUpstream = (): void => {
+        clientClosed = true;
+        upstreamStream?.destroy();
+      };
 
-    try {
-      for await (
-        const chunk of upstreamStream
-      ) {
-        if (
-          req.aborted ||
-          res.destroyed
-        ) {
+      req.once('aborted', abortUpstream);
+      res.once('close', abortUpstream);
+
+      try {
+        const upstream = await resolveUpstream();
+        let rangeHeader: string | undefined;
+
+        if (suffixLength != null && bytesSent === 0) {
+          rangeHeader = `bytes=-${suffixLength}`;
+        } else if (requestedStart != null) {
+          const resumeStart = requestedStart + bytesSent;
+          const cappedEnd = Math.min(
+            requestedEnd ?? Number.MAX_SAFE_INTEGER,
+            requestedStart + maxChunkBytes - 1,
+          );
+          rangeHeader = `bytes=${resumeStart}-${cappedEnd}`;
+        }
+
+        const { response } = await axiosGetWithValidatedRedirects<Readable>(
+          upstream,
+          {
+            responseType: 'stream',
+            timeout: options.upstreamIdleTimeoutMs,
+            maxBodyLength: Number.POSITIVE_INFINITY,
+            maxContentLength: Number.POSITIVE_INFINITY,
+            decompress: false,
+            headers: {
+              'User-Agent': 'NexStream/0.1',
+              Accept: '*/*',
+              'Accept-Encoding': 'identity',
+              Connection: 'keep-alive',
+              ...(rangeHeader ? { Range: rangeHeader } : {}),
+              ...(ifRange && bytesSent === 0 ? { 'If-Range': ifRange } : {}),
+            },
+          },
+        );
+
+        upstreamStream = response.data;
+
+        const contentRangeHeader =
+          typeof response.headers['content-range'] === 'string'
+            ? response.headers['content-range']
+            : null;
+        const contentRangeMatch = contentRangeHeader
+          ? /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(contentRangeHeader)
+          : null;
+        const upstreamLength = Number(response.headers['content-length']);
+        const responseStart = contentRangeMatch ? Number(contentRangeMatch[1]) : null;
+        const responseEnd = contentRangeMatch ? Number(contentRangeMatch[2]) : null;
+        const responseTotal =
+          contentRangeMatch && contentRangeMatch[3] !== '*'
+            ? Number(contentRangeMatch[3])
+            : null;
+        const responseLength =
+          Number.isSafeInteger(upstreamLength) && upstreamLength >= 0
+            ? upstreamLength
+            : null;
+
+        if (options.forceRange && requestedStart != null) {
+          const expectedStart = requestedStart + bytesSent;
+          if (response.status !== 206 || responseStart !== expectedStart) {
+            upstreamStream.destroy();
+            throw new AppError(
+              502,
+              'UPSTREAM_RANGE_UNSUPPORTED',
+              'O servidor de mídia não aceitou continuar do ponto solicitado.',
+            );
+          }
+        }
+
+        if (!headersSent) {
+          let outputStatus = response.status;
+          outputStart = responseStart;
+          outputEnd = responseEnd;
+          outputTotal = responseTotal;
+          outputLength = responseLength;
+
+          if (response.status === 206 && outputStart != null && outputEnd != null) {
+            outputEnd = Math.min(
+              outputEnd,
+              requestedEnd ?? Number.MAX_SAFE_INTEGER,
+              outputStart + maxChunkBytes - 1,
+            );
+            outputLength = outputEnd - outputStart + 1;
+          }
+
+          res.status(outputStatus);
+          const contentType = response.headers['content-type'];
+          if (contentType) res.setHeader('content-type', contentType);
+
+          for (const header of ['etag', 'last-modified', 'content-disposition']) {
+            const value = response.headers[header];
+            if (value != null) res.setHeader(header, value);
+          }
+
+          if (outputLength != null) {
+            res.setHeader('content-length', String(outputLength));
+          }
+
+          if (
+            outputStatus === 206 &&
+            outputStart != null &&
+            outputEnd != null
+          ) {
+            res.setHeader(
+              'content-range',
+              `bytes ${outputStart}-${outputEnd}/${outputTotal ?? '*'}`,
+            );
+            res.setHeader('accept-ranges', 'bytes');
+          } else if (requestedRange || options.forceRange) {
+            res.setHeader('accept-ranges', 'bytes');
+          }
+
+          res.setHeader(
+            'cache-control',
+            options.cacheSeconds > 0
+              ? `private, max-age=${options.cacheSeconds}`
+              : 'private, no-store',
+          );
+          res.setHeader('x-accel-buffering', 'no');
+          res.setHeader('x-nexstream-recovery', 'enabled');
+          res.flushHeaders();
+          headersSent = true;
+        }
+
+        const remainingAtStart =
+          outputLength == null ? null : Math.max(0, outputLength - bytesSent);
+        let remaining = remainingAtStart;
+
+        for await (const chunk of upstreamStream) {
+          if (req.aborted || req.destroyed || res.destroyed || clientClosed) return;
+
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          const output =
+            remaining == null
+              ? buffer
+              : buffer.subarray(0, Math.min(buffer.length, remaining));
+
+          if (output.length > 0) {
+            if (!res.write(output)) await once(res, 'drain');
+            bytesSent += output.length;
+            if (remaining != null) remaining -= output.length;
+          }
+
+          if (remaining != null && remaining <= 0) break;
+        }
+
+        if (outputLength == null || bytesSent >= outputLength) {
+          if (!res.writableEnded) res.end();
           return;
         }
 
-        const buffer =
-          Buffer.isBuffer(chunk)
-            ? chunk
-            : Buffer.from(chunk);
+        throw new Error(
+          `UPSTREAM_PREMATURE_CLOSE: ${bytesSent}/${outputLength} bytes`,
+        );
+      } catch (error) {
+        lastError = error;
 
-        const output =
-          remaining == null
-            ? buffer
-            : buffer.subarray(
-                0,
-                Math.min(
-                  buffer.length,
-                  remaining,
-                ),
-              );
+        if (req.aborted || req.destroyed || res.destroyed || clientClosed) return;
 
-        if (
-          output.length > 0 &&
-          !res.write(output)
-        ) {
-          await once(
-            res,
-            'drain',
-          );
-        }
+        const canRetry =
+          attempt < options.maxAttempts &&
+          isRetryable(error) &&
+          (outputLength == null || bytesSent < outputLength);
 
-        if (remaining != null) {
-          remaining -=
-            output.length;
+        console.warn(
+          JSON.stringify({
+            event: 'playback_upstream_retry',
+            attempt,
+            maxAttempts: options.maxAttempts,
+            bytesSent,
+            outputLength,
+            retry: canRetry,
+            axiosCode: isAxiosError(error) ? error.code : undefined,
+            upstreamStatus: isAxiosError(error) ? error.response?.status : undefined,
+            message: error instanceof Error ? error.message : String(error),
+          }),
+        );
 
-          if (remaining <= 0) {
-            break;
-          }
-        }
+        if (!canRetry) break;
+        await retryDelay(attempt);
+      } finally {
+        upstreamStream?.destroy();
+        req.removeListener('aborted', abortUpstream);
+        res.removeListener('close', abortUpstream);
       }
-
-      completed = true;
-
-      if (!res.writableEnded) {
-        res.end();
-      }
-    } catch (error) {
-      completed = true;
-
-      if (
-        req.aborted ||
-        req.destroyed ||
-        res.destroyed
-      ) {
-        return;
-      }
-
-      throw error;
-    } finally {
-      completed = true;
-
-      upstreamStream.destroy();
-
-      req.removeListener(
-        'aborted',
-        abortUpstream,
-      );
-
-      res.removeListener(
-        'close',
-        abortUpstream,
-      );
     }
+
+    if (headersSent) {
+      res.destroy(
+        lastError instanceof Error
+          ? lastError
+          : new Error('Falha permanente no servidor de mídia.'),
+      );
+      return;
+    }
+
+    if (isAxiosError(lastError)) {
+      const status = lastError.response?.status;
+      if (status === 404) {
+        throw new AppError(
+          502,
+          'UPSTREAM_MEDIA_NOT_FOUND',
+          'O provedor não localizou o vídeo. A URL foi renovada, mas continuou indisponível.',
+        );
+      }
+      if (status === 429 || status === 503) {
+        throw new AppError(
+          503,
+          'UPSTREAM_TEMPORARILY_UNAVAILABLE',
+          'O servidor IPTV está temporariamente ocupado. Tente novamente em instantes.',
+        );
+      }
+    }
+
+    throw new AppError(
+      502,
+      'UPSTREAM_STREAM_FAILED',
+      'Não foi possível manter a conexão com o servidor de vídeo.',
+    );
   }
 }

@@ -83,7 +83,7 @@ function mediaErrorMessage(
     case MediaError.MEDIA_ERR_DECODE:
       return 'O navegador não conseguiu decodificar o vídeo. O conteúdo pode estar em HEVC/H.265 ou outro codec não suportado.';
     case MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED:
-      return 'O formato deste episódio não é compatível com o navegador.';
+      return 'O servidor de vídeo interrompeu a resposta ou enviou um formato não suportado. Tentaremos reconectar automaticamente.';
     default:
       return 'Não foi possível reproduzir este conteúdo.';
   }
@@ -460,12 +460,12 @@ export function VideoPlayer() {
           }
 
           if (
-            automaticRetryCountRef.current >= 3
+            automaticRetryCountRef.current >= 6
           ) {
             setBuffering(false);
 
             setError(
-              'O servidor parou de enviar o vídeo. Pressione Tentar novamente para continuar do mesmo ponto.',
+              'O servidor IPTV permaneceu indisponível após várias tentativas. Pressione Tentar novamente para continuar do mesmo ponto.',
             );
 
             return;
@@ -473,7 +473,7 @@ export function VideoPlayer() {
 
           automaticRetryCountRef.current += 1;
           retryPlayback(false);
-        }, 4_000);
+        }, 2_500);
     }, [
       error,
       retryPlayback,
